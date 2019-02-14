@@ -23,14 +23,14 @@ from tornado import gen, web
 from tornado.httputil import url_concat
 from tornado.httpclient import HTTPRequest, AsyncHTTPClient
 
-from traitlets import Unicode, List, Bool, validate
+from traitlets import Unicode, List, Bool, Union, validate
+from jupyterhub.traitlets import Callable
 
 from jupyterhub.auth import LocalAuthenticator
 
 from .oauth2 import OAuthLoginHandler, OAuthenticator
 
 CILOGON_HOST = os.environ.get('CILOGON_HOST') or 'cilogon.org'
-
 
 class CILogonMixin(OAuth2Mixin):
     _OAUTH_AUTHORIZE_URL = "https://%s/authorize" % CILOGON_HOST
@@ -74,6 +74,17 @@ class CILogonOAuthenticator(OAuthenticator):
             return ['openid'] + proposal.value
         return proposal.value
 
+    user_check_cb = Callable(
+        None,
+        allow_none=True,
+        help="""
+        Callable that determines how to rewrite usernames. If this is
+        set, strip_idp_domain, idp_whitelist are disabled.
+
+        callable accepts one argument (username@domain) and returns the desired
+        username, or None if the user is disallowed
+        """).tag(config=True)
+            
     idp_whitelist = List(
         config=True,
         help="""A list of IDP which can be stripped from the username after the @ sign.""",
@@ -166,15 +177,27 @@ class CILogonOAuthenticator(OAuthenticator):
                            )
             raise web.HTTPError(500, "Failed to get username from CILogon")
 
-        if self.idp_whitelist:
+        self.log.info("CILogon callback: %s", self.user_check_cb)
+        if callable(self.user_check_cb):
+            username_temp = self.user_check_cb(username)
+            self.log.info("CILogon converted %s to %s", username, username_temp)
+            if not username_temp:
+                self.log.error(
+                    "Username failed user_check_cb", username)
+                raise web.HTTPError(
+                    500, "Username/Domain not allowed to log in")
+            username = username_temp
+
+        elif self.idp_whitelist:
             gotten_name, gotten_idp = username.split('@')
             if gotten_idp not in self.idp_whitelist:
                 self.log.error(
                     "Trying to login from not whitelisted domain %s", gotten_idp)
                 raise web.HTTPError(
                     500, "Trying to login from not whitelisted domain")
-            if len(self.idp_whitelist) == 1 and self.strip_idp_domain:
+            if self.strip_idp_domain:
                 username = gotten_name
+        
         userdict = {"name": username}
         # Now we set up auth_state
         userdict["auth_state"] = auth_state = {}
